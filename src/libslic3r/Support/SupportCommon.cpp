@@ -559,235 +559,54 @@ static Polylines draw_perimeters(const ExPolygon &expoly, double clip_length, co
 static inline void tree_supports_generate_paths(
     ExtrusionEntitiesPtr    &dst,
     const Polygons          &polygons,
-    const Flow              &flow, 
+    const Flow              &flow,
     const SupportParameters &support_params)
 {
-    // Offset expolygon inside, returns number of expolygons collected (0 or 1).
-    // Vertices of output paths are marked with Z = source contour index of the expoly.
-    // Vertices at the intersection of source contours are marked with Z = -1.
-    auto shrink_expolygon_with_contour_idx = [](const Slic3r::ExPolygon &expoly, const float delta, ClipperLib::JoinType joinType, double miterLimit, ClipperLib_Z::Paths &out) -> int
-    {
-        assert(delta > 0);
-        auto append_paths_with_z = [](ClipperLib::Paths &src, coord_t contour_idx, ClipperLib_Z::Paths &dst) {
-            dst.reserve(next_highest_power_of_2(dst.size() + src.size()));
-            for (const ClipperLib::Path &contour : src) {
-                ClipperLib_Z::Path tmp;
-                tmp.reserve(contour.size());
-                for (const Point &p : contour)
-                    tmp.emplace_back(p.x(), p.y(), contour_idx);
-                dst.emplace_back(std::move(tmp));
-            }
-        };
-
-        // 1) Offset the outer contour.
-        ClipperLib_Z::Paths contours;
-        {
-            ClipperLib::ClipperOffset co;
-            if (joinType == jtRound)
-                co.ArcTolerance = miterLimit;
-            else
-                co.MiterLimit = miterLimit;
-            co.ShortestEdgeLength = double(delta * 0.005);
-            co.AddPath(expoly.contour.points, joinType, ClipperLib::etClosedPolygon);
-            ClipperLib::Paths contours_raw;
-            co.Execute(contours_raw, - delta);
-            if (contours_raw.empty())
-                // No need to try to offset the holes.
-                return 0;
-            append_paths_with_z(contours_raw, 0, contours);
-        }
-
-        if (expoly.holes.empty()) {
-            // No need to subtract holes from the offsetted expolygon, we are done.
-            append(out, std::move(contours));
-        } else {
-            // 2) Offset the holes one by one, collect the offsetted holes.
-            ClipperLib_Z::Paths holes;
-            {
-                for (const Polygon &hole : expoly.holes) {
-                    ClipperLib::ClipperOffset co;
-                    if (joinType == jtRound)
-                        co.ArcTolerance = miterLimit;
-                    else
-                        co.MiterLimit = miterLimit;
-                    co.ShortestEdgeLength = double(delta * 0.005);
-                    co.AddPath(hole.points, joinType, ClipperLib::etClosedPolygon);
-                    ClipperLib::Paths out2;
-                    // Execute reorients the contours so that the outer most contour has a positive area. Thus the output
-                    // contours will be CCW oriented even though the input paths are CW oriented.
-                    // Offset is applied after contour reorientation, thus the signum of the offset value is reversed.
-                    co.Execute(out2, delta);
-                    append_paths_with_z(out2, 1 + (&hole - expoly.holes.data()), holes);
-                }
-            }
-
-            // 3) Subtract holes from the contours.
-            if (holes.empty()) {
-                // No hole remaining after an offset. Just copy the outer contour.
-                append(out, std::move(contours));
-            } else {
-                // Negative offset. There is a chance, that the offsetted hole intersects the outer contour. 
-                // Subtract the offsetted holes from the offsetted contours.
-                ClipperLib_Z::Clipper clipper;
-                clipper.ZFillFunction([](const ClipperLib_Z::IntPoint &e1bot, const ClipperLib_Z::IntPoint &e1top, const ClipperLib_Z::IntPoint &e2bot, const ClipperLib_Z::IntPoint &e2top, ClipperLib_Z::IntPoint &pt) {
-                        //pt.z() = std::max(std::max(e1bot.z(), e1top.z()), std::max(e2bot.z(), e2top.z()));
-                        // Just mark the intersection.
-                        pt.z() = -1;
-                    });
-                clipper.AddPaths(contours, ClipperLib_Z::ptSubject, true);
-                clipper.AddPaths(holes,    ClipperLib_Z::ptClip,    true);
-                ClipperLib_Z::Paths output;
-                clipper.Execute(ClipperLib_Z::ctDifference, output, ClipperLib_Z::pftNonZero, ClipperLib_Z::pftNonZero);
-                if (! output.empty()) {
-                    append(out, std::move(output));
-                } else {
-                    // The offsetted holes have eaten up the offsetted outer contour.
-                    return 0;
-                }
-            }
-        }
-
-        return 1;
-    };
+    if (polygons.empty())
+        return;
 
     const double spacing = flow.scaled_spacing();
-    // Clip the sheath path to avoid the extruder to get exactly on the first point of the loop.
     const double clip_length = spacing * 0.15;
-    const double anchor_length = spacing * 6.;
-    ClipperLib_Z::Paths anchor_candidates;
-    for (ExPolygon& expoly : closing_ex(polygons, float(SCALED_EPSILON), float(SCALED_EPSILON + 0.5 * flow.scaled_width()))) {
-        std::unique_ptr<ExtrusionEntityCollection> eec;
-        if (support_params.tree_branch_diameter_double_wall_area_scaled > 0)
-            if (double area = expoly.area(); area > support_params.tree_branch_diameter_double_wall_area_scaled) {
-                eec = std::make_unique<ExtrusionEntityCollection>();
-                // Don't reoder internal / external loops of the same island, always start with the internal loop.
-                eec->no_sort = true;
-                // Make the tree branch stable by adding another perimeter.
-                ExPolygons level2 = offset2_ex({ expoly }, -1.5 * flow.scaled_width(), 0.5 * flow.scaled_width());
-                if (level2.size() == 1) {
-                    Polylines polylines;
-                    extrusion_entities_append_paths(eec->entities, draw_perimeters(expoly, clip_length, support_params.prefer_clockwise_movements), { ExtrusionRole::SupportMaterial, flow },
-                        // Disable reversal of the path, always start with the anchor, always print CCW.
-                        false);
-                    expoly = level2.front();
-                }
-            }
 
-        // Try to produce one more perimeter to place the seam anchor.
-        // First genrate a 2nd perimeter loop as a source for anchor candidates.
-        // The anchor candidate points are annotated with an index of the source contour or with -1 if on intersection.
-        anchor_candidates.clear();
-        shrink_expolygon_with_contour_idx(expoly, flow.scaled_width(), DefaultJoinType, 1.2, anchor_candidates);
+    std::unique_ptr<Fill> filler;
+    if (support_params.tree_branch_infill_density > 0)
+        filler = std::unique_ptr<Fill>(Fill::new_from_type(support_params.base_fill_pattern));
 
-        // Based on the way how loops with anchors are constructed (we reverse orientation at the end),
-        // orient all loops CCW when prefer_clockwise_movements is true and orient all loops CW otherwise.
-        for (auto &path : anchor_candidates) {
-            const bool is_ccw = ClipperLib_Z::Area(path) > 0;
-            if (const bool path_reverse = support_params.prefer_clockwise_movements ? !is_ccw : is_ccw; path_reverse)
-                std::reverse(path.begin(), path.end());
+    for (ExPolygon expoly : closing_ex(polygons, float(SCALED_EPSILON), float(SCALED_EPSILON + 0.5 * flow.scaled_width()))) {
+        size_t num_walls = support_params.tree_branch_walls;
+        if (support_params.tree_branch_diameter_double_wall_area_scaled > 0) {
+            double area = expoly.area();
+            if (area > support_params.tree_branch_diameter_double_wall_area_scaled)
+                num_walls = std::max<size_t>(num_walls, 2);
         }
 
-        // Draw the perimeters.
-        Polylines polylines;
-        polylines.reserve(expoly.holes.size() + 1);
-        for (int idx_loop = 0; idx_loop < int(expoly.num_contours()); ++ idx_loop) {
-            // Open the loop with a seam.
-            const Polygon &loop = expoly.contour_or_hole(idx_loop);
-            Polyline pl(loop.points);
-
-            // When prefer_clockwise_movements is true, orient all loops CCW and orient all loops CW otherwise
-            // because the anchor will be added to the end of the polyline while we want to start a loop with the anchor.
-            if (const bool loop_reverse = support_params.prefer_clockwise_movements ? idx_loop != 0 : idx_loop == 0; loop_reverse)
-                pl.reverse();
-
-            pl.points.emplace_back(pl.points.front());
-            pl.clip_end(clip_length);
-            if (pl.size() < 2)
-                continue;
-            // Find the foot of the seam point on anchor_candidates. Only pick an anchor point that was created by offsetting the source contour.
-            ClipperLib_Z::Path *closest_contour = nullptr;
-            Vec2d               closest_point;
-            int                 closest_point_idx = -1;
-            double              closest_point_t = 0.;
-            double              d2min = std::numeric_limits<double>::max();
-            Vec2d               seam_pt = pl.back().cast<double>();
-            for (ClipperLib_Z::Path &path : anchor_candidates)
-                for (int i = 0; i < int(path.size()); ++ i) {
-                    int j = next_idx_modulo(i, path);
-                    if (path[i].z() == idx_loop || path[j].z() == idx_loop) {
-                        Vec2d pi(path[i].x(), path[i].y());
-                        Vec2d pj(path[j].x(), path[j].y());
-                        Vec2d v = pj - pi;
-                        Vec2d w = seam_pt - pi;
-                        auto   l2  = v.squaredNorm();
-                        auto   t   = std::clamp((l2 == 0) ? 0 : v.dot(w) / l2, 0., 1.);
-                        if ((path[i].z() == idx_loop || t > EPSILON) && (path[j].z() == idx_loop || t < 1. - EPSILON)) {
-                            // Closest point.
-                            Vec2d fp = pi + v * t;
-                            double d2 = (fp - seam_pt).squaredNorm();
-                            if (d2 < d2min) {
-                                d2min = d2;
-                                closest_contour   = &path;
-                                closest_point     = fp;
-                                closest_point_idx = i;
-                                closest_point_t   = t;
-                            }
-                        }
-                    }
-                }
-            if (d2min < sqr(flow.scaled_width() * 3.)) {
-                // Try to cut an anchor from the closest_contour.
-                // Both closest_contour and pl are CW oriented.
-                pl.points.emplace_back(closest_point.cast<coord_t>());
-                const ClipperLib_Z::Path &path = *closest_contour;
-                double remaining_length = anchor_length - (seam_pt - closest_point).norm();
-                int i = closest_point_idx;
-                int j = next_idx_modulo(i, *closest_contour);
-                Vec2d pi(path[i].x(), path[i].y());
-                Vec2d pj(path[j].x(), path[j].y());
-                Vec2d v = pj - pi;
-                double l = v.norm();
-                if (remaining_length < (1. - closest_point_t) * l) {
-                    // Just trim the current line.
-                    pl.points.emplace_back((closest_point + v * (remaining_length / l)).cast<coord_t>());
+        for (size_t i = 0; i < num_walls && !expoly.contour.points.empty(); ++i) {
+            extrusion_entities_append_paths(dst, draw_perimeters(expoly, clip_length, support_params.prefer_clockwise_movements),
+                { ExtrusionRole::SupportMaterial, flow }, false);
+            if (i + 1 < num_walls) {
+                ExPolygons inner = offset2_ex({ expoly }, -flow.scaled_spacing(), 0.5 * flow.scaled_spacing());
+                if (inner.empty()) {
+                    expoly.contour.points.clear();
                 } else {
-                    // Take the rest of the current line, continue with the other lines.
-                    pl.points.emplace_back(path[j].x(), path[j].y());
-                    pi = pj;
-                    for (i = j; path[i].z() == idx_loop && remaining_length > 0; i = j, pi = pj) {
-                        j = next_idx_modulo(i, path);
-                        pj = Vec2d(path[j].x(), path[j].y());
-                        v = pj - pi;
-                        l = v.norm();
-                        if (i == closest_point_idx) {
-                            // Back at the first segment. Most likely this should not happen and we may end the anchor.
-                            break;
-                        }
-                        if (remaining_length <= l) {
-                            pl.points.emplace_back((pi + v * (remaining_length / l)).cast<coord_t>());
-                            break;
-                        }
-                        pl.points.emplace_back(path[j].x(), path[j].y());
-                        remaining_length -= l;
-                    }
+                    expoly = inner.front();
                 }
             }
-            // Start with the anchor.
-            pl.reverse();
-            polylines.emplace_back(std::move(pl));
         }
 
-        ExtrusionEntitiesPtr &out = eec ? eec->entities : dst;
-        extrusion_entities_append_paths(out, std::move(polylines), { ExtrusionRole::SupportMaterial, flow },
-            // Disable reversal of the path, always start with the anchor, always print CCW.
-            false);
-        if (eec) {
-            std::reverse(eec->entities.begin(), eec->entities.end());
-            dst.emplace_back(eec.release());
+        if (support_params.tree_branch_infill_density > 0 && !expoly.contour.points.empty()) {
+            if (!filler)
+                filler = std::unique_ptr<Fill>(Fill::new_from_type(support_params.base_fill_pattern));
+            filler->set_bounding_box(expoly.bounding_box());
+            filler->angle = support_params.base_angle;
+            filler->spacing = support_params.support_material_flow.spacing();
+            filler->link_max_length = 0;
+            ExPolygons exps;
+            exps.emplace_back(expoly);
+            fill_expolygons_generate_paths(dst, std::move(exps), filler.get(), float(support_params.tree_branch_infill_density),
+                ExtrusionRole::SupportMaterial, flow);
         }
     }
 }
-
 static inline void fill_expolygons_with_sheath_generate_paths(
     ExtrusionEntitiesPtr    &dst,
     const Polygons          &polygons,
