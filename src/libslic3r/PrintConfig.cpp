@@ -3534,6 +3534,25 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionPercent(15));
 
+    def = this->add("support_tree_branch_walls", coInt);
+    def->label = L("Branch walls");
+    def->category = L("Support material");
+    def->tooltip = L("Number of perimeters printed for tree support branches.");
+    def->min = 0;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("support_tree_branch_infill", coPercent);
+    def->label = L("Branch infill");
+    def->category = L("Support material");
+    def->tooltip = L("Infill density for tree support branches.");
+    def->sidetext = L("%");
+    def->min = 0;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(0));
+
     def = this->add("temperature", coInts);
     def->label = L("Other layers");
     def->tooltip = L("Nozzle temperature for layers after the first one. Set this to zero to disable "

@@ -148,6 +148,8 @@ SupportParameters::SupportParameters(const PrintObject &object)
     }
 
     this->tree_branch_diameter_double_wall_area_scaled = 0.25 * sqr(scaled<double>(object_config.support_tree_branch_diameter_double_wall.value)) * M_PI;
+    this->tree_branch_walls = size_t(object_config.support_tree_branch_walls);
+    this->tree_branch_infill_density = double(object_config.support_tree_branch_infill) / 100.;
 
     this->prefer_clockwise_movements = print_config.prefer_clockwise_movements;
 }

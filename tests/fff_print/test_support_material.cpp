@@ -2,6 +2,7 @@
 
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/Support/SupportParameters.hpp"
 
 #include "test_data.hpp" // get access to init_print, etc
 
@@ -495,3 +496,16 @@ Old Perl tests, which were disabled by Vojtech at the time of first Support Gene
 }
 
 */
+
+TEST_CASE("SupportMaterial: tree branch parameters propagate", "[SupportMaterial]")
+{
+    Slic3r::Print print;
+    Slic3r::Test::init_and_process_print({ TestMesh::cube_20x20x20 }, print, {
+        { "support_material", 1 },
+        { "support_tree_branch_walls", 2 },
+        { "support_tree_branch_infill", "10%" }
+    });
+    FFFSupport::SupportParameters params(*print.objects().front());
+    REQUIRE(params.tree_branch_walls == 2);
+    REQUIRE(params.tree_branch_infill_density == Approx(0.10).margin(0.0001));
+}

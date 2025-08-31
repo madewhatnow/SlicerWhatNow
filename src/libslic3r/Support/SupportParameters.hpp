@@ -89,6 +89,8 @@ struct SupportParameters {
     bool                    with_sheath;
     // Branches of organic supports with area larger than this threshold will be extruded with double lines.
     double                  tree_branch_diameter_double_wall_area_scaled;
+    size_t                  tree_branch_walls;
+    coordf_t                tree_branch_infill_density;
 
     float 					raft_angle_1st_layer;
     float 					raft_angle_base;
